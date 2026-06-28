@@ -1,0 +1,32 @@
+[package]
+name = "voxels"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+# Bevy ECS/app only — own winit+wgpu, so default features off. Replicon needs bevy_state.
+# Add the subcrates your render glue actually wants (e.g. bevy_window) here.
+bevy = { version = "0.19", default-features = false, features = ["bevy_state"] }
+
+# Server-authoritative replication. Drop `scene` (pulls bevy_scene/bevy_asset); keep both sides.
+bevy_replicon = { version = "0.40", default-features = false, features = ["client", "server"] }
+
+# Messaging backend (Replicon has no I/O of its own): renet2 fork, UDP-only for now.
+# `native_transport` = UDP socket (implies netcode); `steam` feature stays OFF, so no
+# Steamworks SDK is pulled. Steam roadmap: add "steam" later for connect-by-SteamID,
+# running UDP + Steam transports together (see steam-networking-deferred memory).
+# 0.17 requires bevy_replicon ^0.40 + bevy ^0.18 — matches the pins above.
+bevy_replicon_renet2 = { version = "0.17", features = ["native_transport"] }
+
+# Own rendering + windowing stack (Bevy's render features are off). wgpu 29 and
+# winit 0.30 are paired via raw-window-handle 0.6 — keep all three rwh-0.6-compatible.
+wgpu = "29"
+winit = "0.30"
+raw-window-handle = "0.6"
+crossbeam-channel = "0.5.15"
+
+# Compile dependencies optimized even in dev builds, so `cargo run` gets release-speed
+# deps (Bevy/wgpu are unusable at opt-level 0) while our own crate stays at opt-level 0
+# for fast incremental rebuilds. Standard Bevy setup.
+[profile.dev.package."*"]
+opt-level = 3
