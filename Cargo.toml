@@ -20,7 +20,7 @@ bevy_replicon_renet2 = { version = "0.17", features = ["native_transport"] }
 
 # Own rendering + windowing stack (Bevy's render features are off). wgpu 29 and
 # winit 0.30 are paired via raw-window-handle 0.6 — keep all three rwh-0.6-compatible.
-wgpu = "29"
+wgpu = "30"
 winit = "0.30"
 raw-window-handle = "0.6"
 crossbeam-channel = "0.5.15"
