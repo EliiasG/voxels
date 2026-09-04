@@ -6,7 +6,7 @@ edition = "2024"
 [dependencies]
 # Bevy ECS/app only — own winit+wgpu, so default features off. Replicon needs bevy_state.
 # Add the subcrates your render glue actually wants (e.g. bevy_window) here.
-bevy = { version = "0.19", default-features = false, features = ["bevy_state"] }
+bevy = { version = "0.18", default-features = false, features = ["bevy_state"] }
 
 # Server-authoritative replication. Drop `scene` (pulls bevy_scene/bevy_asset); keep both sides.
 bevy_replicon = { version = "0.40", default-features = false, features = ["client", "server"] }
@@ -18,11 +18,12 @@ bevy_replicon = { version = "0.40", default-features = false, features = ["clien
 # 0.17 requires bevy_replicon ^0.40 + bevy ^0.18 — matches the pins above.
 bevy_replicon_renet2 = { version = "0.17", features = ["native_transport"] }
 
-# Own rendering + windowing stack (Bevy's render features are off). wgpu 29 and
-# winit 0.30 are paired via raw-window-handle 0.6 — keep all three rwh-0.6-compatible.
-wgpu = "30"
-winit = "0.30"
-raw-window-handle = "0.6"
+modul_core = { git = "https://github.com/EliiasG/modul" }
+modul_render = { git = "https://github.com/EliiasG/modul" }
+modul_asset = { git = "https://github.com/EliiasG/modul" }
+modul_util = { git = "https://github.com/EliiasG/modul" }
+modul_texture = { git = "https://github.com/EliiasG/modul" }
+
 crossbeam-channel = "0.5.15"
 
 # Compile dependencies optimized even in dev builds, so `cargo run` gets release-speed

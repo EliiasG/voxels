@@ -2,7 +2,7 @@ use bevy::tasks::ComputeTaskPool;
 
 pub mod chunk;
 pub mod utils;
-mod render;
+pub mod render;
 
 fn main() {
     println!("Hello, world!!");

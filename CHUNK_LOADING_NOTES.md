@@ -26,27 +26,25 @@ Two recurring tools do most of the work:
 
 ## 0. The two worlds (the spine)
 
-The engine runs **two ECS worlds on two threads**:
+The engine runs **two ECS worlds on two threads** — see `ARCHITECTURE_NOTES.md` for
+the general split, naming (Primary/Sim), threading mechanics, and the cross-world
+communication design (channels, events, replication). What follows here is only the
+chunk-specific framing:
 
 - **Sim world (20 Hz)** — *produces the world*. Owns terrain gen, the edit overlay,
   entity simulation, the chunk index/refcounts, and the chunk **production pipeline**
   (gen → mesh). Wears a **client or server hat** depending on connection.
-- **Gameplay world (framerate)** — *presents & interacts with the world*. Owns the
+- **Primary world (framerate)** — *presents & interacts with the world*. Owns the
   camera, input, prediction, GPU upload, drawing, and the instant-edit fast-path.
 
-**Why two worlds (and why this isn't quite "internal server"):** the split puts the
-sim world's heavy 20 Hz work on its own thread, so it runs *concurrently* with the
-framerate loop — the gameplay world reads its own state and never stalls on a long
-tick or a lock. It also matches the Replicon MP commitment so SP and MP don't fork.
-But it is **not** a classic integrated server: **connected clients generate their own
-terrain locally** (see §1), so the 20 Hz world is *the client* when connected to a
-remote server — not a server the client talks to.
-
-**This is the fix to the original "FixedUpdate stall" problem.** Bevy's schedules run
-sequentially inside one `app.update()`; a >10 ms `FixedUpdate` would delay `Update`
-(the frame) by that much, and FixedUpdate's catch-up multiplies it. Putting the sim on
-its own thread + keeping heavy work on pools (§6, §7) removes the sim from the frame's
-critical path entirely.
+**Why chunk work specifically forced this split (not quite "internal server"):**
+Bevy's schedules run sequentially inside one `app.update()`; a >10 ms `FixedUpdate`
+would delay `Update` (the frame) by that much, and FixedUpdate's catch-up multiplies
+it. Putting the sim on its own thread + keeping heavy chunk work on pools (§6, §7)
+removes it from the frame's critical path entirely — this was the original motivation
+for the split. It is **not** a classic integrated server, though: **connected clients
+generate their own terrain locally** (see §1), so the 20 Hz world is *the client* when
+connected to a remote server — not a server the client talks to.
 
 ---
 
@@ -72,8 +70,9 @@ float path, or server-reconciles-divergence). Open: which (§11).
 ## 2. Chunk loaders, the desired set, and refcounting
 
 A **loader** declares "keep chunks resident around me." It is a subscription the
-**gameplay world sends to the sim world** (camera position + radius + LOD field) — the
-same message in SP and MP. The sim world owns the residency bookkeeping.
+**Primary world sends to the sim world** — replicated automatically (camera position +
+radius + LOD field), not a bespoke message (see `ARCHITECTURE_NOTES.md` §4). Same path
+in SP and MP. The sim world owns the residency bookkeeping.
 
 ```rust
 ChunkLoader { detail_radius, last_chunk_pos }   // world pos via Transform; LOD count global
@@ -81,7 +80,7 @@ ChunkLoader { detail_radius, last_chunk_pos }   // world pos via Transform; LOD 
 
 - The loader's `Entity` is its identity — **no explicit ID field** (that was for a
   subscriber list we don't keep).
-- `last_chunk_pos` is the boundary-crossing cache (§3), not gameplay state.
+- `last_chunk_pos` is the boundary-crossing cache (§3), not Primary-world state.
 - LOD count stays **global** (the index already holds one) until a second camera needs
   genuinely different LODs.
 
@@ -194,15 +193,15 @@ pools:
 - **Gen (voxels)** — sim world's job. On a pool, so the 20 Hz tick stays short and
   streaming stays responsive (a long tick delays replication, not just gen).
 - **Mesh (voxels → CPU vertex/index buffers)** — also the sim world's job. **This is a
-  correction to an earlier guess that meshing belongs in the gameplay world.** Meshing
+  correction to an earlier guess that meshing belongs in the Primary world.** Meshing
   belongs in the sim world because:
   - **Remesh is triggered by voxel changes** (gen completes, edit lands) — events that
-    *originate* in the sim world. Gameplay would have to be told; the sim world knows.
+    *originate* in the sim world. Primary would have to be told; the sim world knows.
   - **Meshing needs neighbor voxels** — the sim world owns all of them.
   - **The LOD to mesh at is the same loader/LOD field that already drives gen** — gen
     and mesh become one pipeline keyed on the camera subscription.
 
-Result: the sim world produces (voxels + meshes); the **gameplay world shrinks to
+Result: the sim world produces (voxels + meshes); the **Primary world shrinks to
 upload + draw + input + predict** — a smaller smooth-world surface = fewer places for an
 accidental O(n) scan to creep onto the frame path. (Caveat: the dominant smoothness
 lever is still "heavy work on pools + bounded main-thread work"; moving meshing refines
@@ -244,9 +243,9 @@ Routing *everything* through the 20 Hz sim world would make a block break round-
 ≥50 ms before it even schedules a remesh. So split by latency/throughput:
 
 - **Streaming / bulk meshes → sim world** (high throughput; 50 ms granularity is
-  invisible at distance — and the completed-mesh channel is drained by gameplay **every
+  invisible at distance — and the completed-mesh channel is drained by Primary **every
   frame**, so streaming latency isn't tied to the tick clock).
-- **The chunk the player just edited → immediate local remesh in the gameplay world**
+- **The chunk the player just edited → immediate local remesh in the Primary world**
   (one chunk, sub-ms, instant feel). The sim world's authoritative remesh replaces it a
   tick later — identical geometry in SP, reconciled in MP. Bounded redundancy (one
   chunk, on a rare action) bought for instant feedback.
@@ -255,12 +254,19 @@ Routing *everything* through the 20 Hz sim world would make a block break round-
 
 ## 9. Cross-world communication
 
-- **gameplay → sim:** loader subscription (camera pos / radius / LOD), commands (edit,
-  interact, take-item, deal-damage).
-- **sim → gameplay:** ready CPU meshes (channel, drained per frame), replicated entity
-  state, edit confirmations.
+General mechanism (channels/events/replication, entity id mapping) is in
+`ARCHITECTURE_NOTES.md` §4. Chunk-specific instances of it:
+
+- **Loader subscription (Primary → sim)** — replicated automatically (§2), not a
+  bespoke message.
+- **Commands (edit, interact, take-item, deal-damage)** — Events, Primary → sim.
+- **Ready CPU meshes (sim → Primary)** — the direct-channel escape hatch, not
+  replication: chunk state is too involved (meshing, `Arc`-swap CoW, §7) for generic
+  diff-and-copy.
+- **Replicated entity state, edit confirmations (sim → Primary)** — the general
+  replication/event paths.
 - **GPU upload stays on the render thread.** The sim pool produces *CPU* vertex/index
-  buffers; the gameplay world allocates + uploads to wgpu (budgeted) and draws — because
+  buffers; the Primary world allocates + uploads to wgpu (budgeted) and draws — because
   the wgpu queue lives render-side. (Sharing an `Arc<Queue>` to upload from the task is
   possible; allocation/ordering are simpler render-side — revisit only if profiling
   wants it.)
@@ -290,7 +296,7 @@ Routing *everything* through the 20 Hz sim world would make a block break round-
   coarse-first.
 - **Residency: stacked clipmap vs concentric shells** (§5) — the memory/feature driver;
   leans stacked for CSM carving.
-- **SP edit path:** write the shared store directly (instant, gameplay applies) vs
+- **SP edit path:** write the shared store directly (instant, Primary applies) vs
   round-trip through the sim world (≤50 ms, strictly sim-authoritative). Sets how much
   prediction machinery is needed later.
 - **Gen determinism strictness** (§1): fixed-point / controlled-float / reconcile.
@@ -306,9 +312,9 @@ Routing *everything* through the 20 Hz sim world would make a block break round-
 
 ## 12. Decided-against (so these aren't re-litigated after a context reset)
 
-- **A second *gameplay* world inside a render world.** Bevy's render world is for GPU
-  pipelining only — and `bevy_render` is off here anyway. Rate-decoupling comes from the
-  sim/gameplay split + pools, not from putting gameplay in a render world.
+- **A second *Primary-like* world inside a render world.** Bevy's render world is for
+  GPU pipelining only — and `bevy_render` is off here anyway. Rate-decoupling comes
+  from the sim/Primary split + pools, not from putting Primary in a render world.
 - **Storing the voxel grid as World-mediated components with all access in-schedule.**
   That forces heavy work onto the frame-blocking schedule. Resolved by `Arc` CoW + the
   two-world-on-two-threads split (components are still fine for the *handle*).
