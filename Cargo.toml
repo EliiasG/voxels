@@ -24,6 +24,8 @@ modul_asset = { git = "https://github.com/EliiasG/modul" }
 modul_util = { git = "https://github.com/EliiasG/modul" }
 modul_texture = { git = "https://github.com/EliiasG/modul" }
 
+bytemuck = {  version = "1.25", features = ["derive"] }
+
 crossbeam-channel = "0.5.15"
 
 # Compile dependencies optimized even in dev builds, so `cargo run` gets release-speed
