@@ -92,7 +92,7 @@ project, `EliiasG/modul`). This shapes how Primary is built, not just what it dr
   schedule vocabulary — `Update` means "once per `Redraw`" on Primary and "once per
   tick" on Sim, different cadence, same label. `PreInit`/`Init`/`Redraw` stay modul's
   own bootstrap/display-pacing schedules regardless — no bevy_app equivalent, not
-  meant to be replaced. `src/sim.rs`'s replication code (§4) is already written
+  meant to be replaced. `../src/sim.rs`'s replication code (§4) is already written
   assuming this bridge exists, using standard schedules throughout.
 
 ---
@@ -102,7 +102,7 @@ project, `EliiasG/modul`). This shapes how Primary is built, not just what it dr
 Sim has no windowing/GPU state at all, so unlike Primary it doesn't need to live on
 any particular thread for platform reasons — it's a genuine standalone `App`, built
 *inside* the `thread::spawn` closure, not before it. The whole mechanism lives in
-**`src/sim.rs`**:
+**`../src/sim.rs`**:
 
 - **Papercut driving the split below: `App` is not `Send` in this bevy version**,
   regardless of which runner is set — its `runner` field is `Box<dyn FnOnce(App) ->
@@ -198,7 +198,7 @@ confirmations, entity spawn/despawn notifications (see below).
 
 ### Automatic replication: continuous mirror of selected components
 
-Implemented in `src/sim.rs` (`ReplicateExt`). Opt-in per component type (not
+Implemented in `../src/sim.rs` (`ReplicateExt`). Opt-in per component type (not
 everything), continuous value sync from an *origin* entity onto a *shadow* entity in
 the other world — built entirely on top of the Events substrate above, not a
 separate mechanism:

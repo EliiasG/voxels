@@ -137,6 +137,155 @@ Costs to plan for:
   Fine for cave ceilings / distant cliffs (soft is desirable); don't reuse LOD0's
   bias on LOD3.
 
+## Update scheduling: pull, not push
+
+- **Pull model**: level *N*, on its own update cadence, reads whatever
+  `merged[N+1]` currently holds (however stale) to build
+  `merged[N] = OR(own[N] carved, merged[N+1])`. Never the reverse — a coarse
+  level's update never notifies or forces work on finer levels. Matches "finer
+  levels update far more often anyway": pushing from a rare coarse-update event
+  would just be re-derived moments later by the finer level's own next cycle.
+- **Dirty trigger: snap, don't schedule by frame-fraction.** Snap each cascade's
+  footprint center to multiples of its own texel size; a cascade is dirty only
+  when camera motion (or sun-angle drift) crosses a snap boundary. Update
+  frequency falls out of actual movement instead of a hand-picked "LOD0 every 2
+  frames, LOD1 every 4…" schedule, and needs no special-casing for teleport/fast
+  travel — that's just many snap cells crossed in one frame, handled as a burst
+  (render all now-dirty `own[N]` passes — independent of each other — then run
+  the coarsest-to-finest merge reduction once).
+- **Cap re-renders at ~1 cascade per frame via a dirty-priority queue**
+  (finest/most-important dirty cascade drains first). Bounds per-frame GPU cost
+  to something predictable without an async-compute queue (unreliable win on
+  iGPU — real fencing/sync complexity for uncertain parallel throughput on
+  exactly the hardware floor this project targets). A multi-cascade dirty burst
+  just becomes a short backlog drained over the next few frames — free, since
+  tolerating coarse-cascade staleness is the whole premise of this design.
+- **LOD0 dynamic entities**: split into a cached static-terrain layer (dirtied
+  by the snap-grid rule + voxel edits) and a small dynamic-entity overlay
+  re-rendered every frame, composited at sample time. Same caching idea as the
+  hero-light shadow maps above, applied to the sun's near cascade — avoids
+  re-rendering all of LOD0's static geometry every frame just because one
+  entity moved.
+- **No reprojection needed for cross-cascade sampling.** Combining `own[N]`
+  with a possibly-stale `merged[N+1]` (different last-render origin) is just a
+  per-sample coordinate transform through each cascade's own stored light-space
+  matrix — exactly how ordinary multi-cascade shadow sampling already works,
+  since a directional-light buffer of static-ish geometry has no
+  disocclusion/ghosting failure mode the way screen-space TAA does. True
+  reprojection (an integer-texel shift) is only needed for the *optional*
+  scroll-cache trick — reusing a level's own buffer across its own successive
+  updates instead of a full re-render — and the texel-snap above buys that for
+  free.
+
+## Carve correctness needs a convex LOD field — ours isn't, by default
+
+- The cascade-per-LOD carve excludes finer-LOD-active regions from a coarser
+  cascade's rasterization. A cheaper-looking alternative — render everything
+  into one depth buffer, tag carved fragments, discard tagged texels at merge
+  time — is **not equivalent** and can silently drop real occluders.
+- Why: a shadow map keeps only the nearest fragment per texel. If a carved
+  (near) fragment happens to be nearer to the light than a legitimate (far,
+  non-carved) occluder sharing the same light-space column, the legitimate
+  occluder loses the depth test and is never even written — there's no "second
+  place" to recover after the fact. Tag-then-filter can only inspect the
+  winner; it can't resurrect what the winner buried.
+- **This can't happen if the carved region is convex per light ray.** Two
+  points sharing a shadow-map texel are collinear (same light-space column); if
+  both a carved fragment and a receiver sit inside a convex carved volume, the
+  whole segment between them — including anything "sandwiched" between them —
+  is inside it too. So a non-carved occluder can never be the thing hidden
+  behind a carved one. Box- and sphere-shaped LOD thresholds are both
+  individually convex — that's not where the risk is.
+- **The risk is chunk quantization.** An axis-aligned (Chebyshev) threshold,
+  evaluated per-chunk on an axis-aligned chunk grid, quantizes to *exactly* a
+  box — zero distortion, provably convex, and cheaper to compute
+  (`max(abs(dx),abs(dy),abs(dz))`, no sqrt) than a sphere test. A spherical
+  threshold quantized the same way produces a staircase boundary, which is
+  **not convex** (classic L-shaped-notch problem) — reopening the
+  dropped-occluder case in a thin ring right at the LOD boundary.
+- **Our chunk residency is spherical** (`SphereChunkSubscriber`), not boxed —
+  chosen for even streaming in every direction. So the naive
+  single-buffer-plus-tag carve is not exactly correct for real LOD transitions.
+- **Fix: one geometry pass, two depth outputs**, not two rasterization passes.
+  Tag each draw with its existing carve flag. Fragment shader writes true depth
+  to `own_full` unconditionally; writes true depth to `own_carved` only for
+  non-carved fragments, and a sentinel (+∞) for carved ones. `own_carved`'s
+  depth-test race excludes carved fragments entirely, so a legitimate occluder
+  behind one always wins on its own merits — no dropped occluders, no second
+  geometry submission, just one extra depth-sized buffer per real-LOD cascade.
+
+## Close geometry casting onto farther cascades
+
+- `own_full` (uncaved, includes near/carved-region geometry) feeds a cascade's
+  **own native-tier receivers**. Needed because a tall or large caster near the
+  camera can have a shadow throw (`height / tan(sun_elevation)`) that outruns
+  its own cascade's footprint under a low sun — without this, that caster's
+  shadow simply never reaches the far receivers it should.
+- `own_carved` (sentinel-masked, previous section) feeds the **merge/OR chain**
+  consumed by finer levels' far-occluder check. Excluding near geometry there
+  isn't about correctness of the occluder fact itself — it's about not
+  polluting a near receiver's already-precise native answer with a
+  lower-resolution, higher-bias duplicate of the same geometry
+  (peter-panning/self-shadow mismatch at the LOD seam).
+- This distinction **only matters at real LOD transitions**, where mesh detail
+  actually changes between neighboring cascades. It doesn't apply between
+  cascades rendering identical mesh (see LOD0 below) — there's no detail
+  mismatch to protect against.
+
+## LOD0 isn't one cascade — it's a small ordinary CSM stack
+
+- Every real LOD *n* ≥ 1 renders only the annulus `(R_n/2, R_n]` (main-view
+  rendering already excludes the inner half — the finer LOD underneath handles
+  it) — a fixed 2:1 distance band, always bounded away from the camera.
+  **LOD0 alone renders the full disc `(0, R_0]`**, reaching all the way to
+  contact distance, which is the one place shadow crispness (contact shadows,
+  high-frequency penumbra) actually matters perceptually.
+- For a fixed cascade resolution, texel-to-native-feature-size ratio works out
+  to `2·radius_end / texRes` — **independent of the LOD level**, because
+  footprint radius and native feature size both double every level and the
+  `2ⁿ` cancels. So one cascade per real LOD (n≥1) is exactly enough forever,
+  regardless of render distance or LOD count. LOD0 has no such fixed band to
+  exploit — it has to cover everything from contact distance to `R_0` at once,
+  which one buffer can't do without being either too coarse up close or
+  absurdly large overall (e.g. ~20 texels/voxel at contact distance over a
+  640-voxel-diameter footprint implies a ~12,800² texture).
+- Chunk granularity kills carving as an option here directly: a shell radius
+  near or below `CHUNK_SIZE` has no clean per-chunk in/out decision to make.
+- **Resolution: plain graduated CSM, not the carve+OR machinery.** A handful of
+  nested cascades sharing the *same* LOD0 mesh (e.g. for
+  `radius_end=10, CHUNK_SIZE=32`: radii 20/40/80/160/320 voxels), each
+  independently frustum/AABB-culled and rendered whole — no carving, no
+  internal OR-merge, since nothing is excluded there's nothing to miss. A
+  receiver just picks the tightest cascade that contains it, exactly like
+  textbook CSM (except these are spherical shells around the camera, not
+  view-frustum Z-slices, since the underlying LOD field is spherical too).
+- **Bonus:** the outermost LOD0 cascade (`r=R_0`) is complete/uncaved by
+  construction — it already *is* the `own_full` buffer LOD1's receivers need at
+  that seam. LOD1 can OR-check it directly instead of needing a separate
+  own_full pass there. (LOD1, LOD2, … still need their own dual-buffer
+  treatment for casting *further* out, since they still carve internally
+  against real LOD boundaries.)
+
+## Shading-time cascade selection
+
+- **LOD1+:** the cascade index is implicit in which draw call rendered the
+  pixel (same active-LOD field that picked the mesh) — no runtime search.
+  Sample `own[n]` + `merged[n+1]`: two fetches.
+- **LOD0:** genuine runtime pick, since its stack shares one mesh tier. Compute
+  3D distance from the fragment to the camera and compare against the (small,
+  fixed) shell-radius array — implement **branchless** (step-function
+  arithmetic building an index, not `if/else`), so lanes near a shell boundary
+  diverge in *data*, never in *instruction stream*. Sample `own[shell]` +
+  `merged[LOD1]`: also two fetches.
+- **Total per-pixel cost**: one branchless select + ~2 shadow texture fetches
+  (the coarser-merge one samplable at half/quarter-res, being low-frequency) +
+  a small PCF kernel (~4 taps) for softening. Bounded, coherent, independent
+  per pixel — the same cost class as any ordinary single/multi-cascade shadow
+  lookup already shipping on mobile and integrated GPUs. Contrast with the
+  original per-pixel DDA march this replaced: that died from *unbounded,
+  incoherent, dependent* memory access; this is *bounded, coherent,
+  data-parallel* — the difference the whole CSM decision was made to buy.
+
 ## Direct lighting: many clustered lights + few shadows
 
 **Light count ≠ shadow count.** Conflating them is the classic mistake.
@@ -421,9 +570,13 @@ not with glass.
 - **Keep colored transparent shadows?** If yes, a sparse voxel-march pass shares
   the grid with GI; if no, the whole grid/bitmask subsystem can be deleted in
   favor of CSM.
-- **Is the LOD field strictly concentric** or can it be irregular (visibility/
-  importance-driven)? Decides whether carving is a trivial radius check or a real
-  "all-finer-loaded" query.
+- ~~Is the LOD field strictly concentric or can it be irregular?~~ **Resolved
+  for carving purposes**: chunk residency is a quantized sphere
+  (`SphereChunkSubscriber`), which is not convex, so real-LOD carving needs the
+  own_full/own_carved dual-buffer fix rather than a cheap single-buffer tag
+  (see "Carve correctness needs a convex LOD field" above). Still open if
+  visibility/importance-driven irregularity is wanted for reasons other than
+  shadows — that would need revisiting this fix.
 - **Any frosted / partial-coverage transparent material?** That's the one case the
   commutative tint+emission accumulation can't do (true order-dependent coverage) →
   would force sorting or WBOIT. Clear glass + water don't need it; frosted would.
