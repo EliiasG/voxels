@@ -17,9 +17,7 @@
 //! the last *applied* residency params are snapshotted in the private [`AppliedState`].
 //! Diffing new-vs-applied makes any param change (move, grow, more LODs) correct.
 
-use crate::chunk::manager::{
-    ChunkList, ChunkSubscribeMessage, ChunkSubscriber, ChunkUnsubscribeMessage, SubscriberEntity,
-};
+use crate::chunk::manager::{ChunkBatchPriority, ChunkPositionBatch, ChunkSubscribeMessage, ChunkSubscriber, ChunkUnsubscribeMessage, SubscriberEntity};
 use crate::chunk::{ChunkPosition, MAX_LOD_COUNT};
 use bevy::prelude::*;
 
@@ -119,7 +117,7 @@ fn update_sphere_subscribers(
             // inside(old) \ inside(new): provably a subset of what we held, so no check
             sphere_difference(old_c, old_r, new_c, new_r, &mut chunks);
             if !chunks.is_empty() {
-                unsub_buckets.push(ChunkList { lod, chunks });
+                unsub_buckets.push(ChunkPositionBatch { lod, chunks });
             }
         }
         if !unsub_buckets.is_empty() {
@@ -169,7 +167,7 @@ fn build_subscribe_buckets(
     old_center: IVec3,
     old_radius: i32,
     old_lods: usize,
-) -> Vec<ChunkList> {
+) -> Vec<(ChunkPositionBatch, ChunkBatchPriority)> {
     let begin = sphere.radius_begin as i32;
     let step = (sphere.radius_step.max(1)) as i32; // guard against a 0 step
 
@@ -202,6 +200,7 @@ fn build_subscribe_buckets(
     // group runs of equal (shell, rank) — i.e. equal (shell, lod) — into one bucket
     let mut buckets = Vec::new();
     let mut i = 0;
+    let mut p = 0;
     while i < entries.len() {
         let (shell, rank, _, lod, _) = entries[i];
         let mut chunks = Vec::new();
@@ -209,7 +208,8 @@ fn build_subscribe_buckets(
             chunks.push(entries[i].4);
             i += 1;
         }
-        buckets.push(ChunkList { lod, chunks });
+        buckets.push((ChunkPositionBatch { lod, chunks }, p));
+        p += 1;
     }
     buckets
 }
@@ -287,6 +287,7 @@ fn sphere_difference(c_in: IVec3, r_in: i32, c_ex: IVec3, r_ex: i32, out: &mut V
     }
 }
 
+//fixme tests might be outdated after addition of priority
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -388,7 +389,7 @@ mod tests {
 
         // buckets strictly increase in (shell, lod) — shell-major, LOD-ascending
         let mut prev: Option<(i32, usize)> = None;
-        for b in &buckets {
+        for (b, p) in &buckets {
             let center_l = shr(IVec3::ZERO, b.lod as u32);
             let shells: HashSet<i32> = b
                 .chunks
@@ -407,8 +408,8 @@ mod tests {
         for lod in 0..3usize {
             let got: HashSet<IVec3> = buckets
                 .iter()
-                .filter(|b| b.lod == lod)
-                .flat_map(|b| b.chunks.iter().copied())
+                .filter(|(b, _)| b.lod == lod)
+                .flat_map(|(b, _)| b.chunks.iter().copied())
                 .collect();
             assert_eq!(got, full_sphere(shr(IVec3::ZERO, lod as u32), 5), "LOD {lod} coverage");
         }

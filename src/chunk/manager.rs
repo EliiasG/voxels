@@ -37,17 +37,35 @@ impl<G: ChunkLoader + Send + Sync + 'static> Plugin for ChunkManagerPlugin<G> {
     }
 }
 
+#[derive(Copy, Clone)]
+pub enum ChunkSubscriberPriority {
+    Highest = 0,
+    High = 1,
+    Normal = 2,
+    Low = 3,
+    Lowest = 4,
+}
+
+/// Lower number = higher priority
+pub type ChunkBatchPriority = u8;
+
+impl Default for ChunkSubscriberPriority {
+    fn default() -> Self {
+        Self::Normal
+    }
+}
+
 #[derive(Component, Default)]
 pub struct ChunkSubscriber {
-    priority: u32,
+    priority: ChunkSubscriberPriority,
 }
 
 impl ChunkSubscriber {
-    pub fn new(priority: u32) -> Self {
+    pub fn new(priority: ChunkSubscriberPriority) -> Self {
         Self { priority }
     }
 
-    pub fn priority(&self) -> u32 {
+    pub fn priority(&self) -> ChunkSubscriberPriority {
         self.priority
     }
 }
@@ -55,20 +73,20 @@ impl ChunkSubscriber {
 #[derive(Message)]
 pub struct ChunkSubscribeMessage {
     pub subscriber: SubscriberEntity,
-    pub buckets: Vec<ChunkList>,
+    pub buckets: Vec<(ChunkPositionBatch, ChunkBatchPriority)>,
 }
 
 #[derive(Message)]
 pub struct ChunkUnsubscribeMessage {
-    pub buckets: Vec<ChunkList>,
+    pub buckets: Vec<ChunkPositionBatch>,
 }
 
-pub struct ChunkList {
+pub struct ChunkPositionBatch {
     pub lod: usize,
     pub chunks: Vec<IVec3>,
 }
 
-pub struct ChunkReferenceList {
+pub struct ChunkReferenceBatch {
     pub lod: usize,
     pub chunks: Vec<ChunkReference>,
 }
@@ -85,18 +103,18 @@ pub struct ChunkGeneratorOutput {
 }
 
 pub trait ChunkLoader {
-    fn register_subscriber(&mut self, subscriber: SubscriberEntity, priority: u32);
+    fn register_subscriber(&mut self, subscriber: SubscriberEntity, priority: ChunkSubscriberPriority);
     fn deregister_subscriber(&mut self, subscriber: SubscriberEntity);
     /// Register unloaded chunks from a [ChunkSubscribeMessage]. Might contain chunks that have already been registered.
     /// Entity ids should be kept for when outputting.
     fn register_subscribe_message(
         &mut self,
         subscriber: SubscriberEntity,
-        buckets: &Vec<ChunkReferenceList>,
+        buckets: &Vec<(ChunkReferenceBatch, ChunkBatchPriority)>,
     );
 
     /// Called for chunks that are no longer needed
-    fn free_chunks(&mut self, chunks: &ChunkList);
+    fn free_chunks(&mut self, chunks: &ChunkPositionBatch);
 
     fn pop(&mut self) -> Option<ChunkGeneratorOutput>;
 }
@@ -159,7 +177,7 @@ fn handle_unsubscribed_chunks<G: ChunkLoader + Send + Sync + 'static>(
     mut chunk_query: Query<&mut ChunkSubscriberCount>,
 ) {
     for message in reader.read() {
-        for ChunkList { lod, chunks } in &message.buckets {
+        for ChunkPositionBatch { lod, chunks } in &message.buckets {
             let map = chunk_index.get_mut(*lod);
             let despawned = chunks
                 .iter()
@@ -194,7 +212,7 @@ fn handle_unsubscribed_chunks<G: ChunkLoader + Send + Sync + 'static>(
                 })
                 .copied()
                 .collect();
-            generator.0.free_chunks(&ChunkList {
+            generator.0.free_chunks(&ChunkPositionBatch {
                 lod: *lod,
                 chunks: despawned,
             });
@@ -214,7 +232,7 @@ fn schedule_generation<G: ChunkLoader + Send + Sync + 'static>(
         let buckets = message
             .buckets
             .iter()
-            .map(|bucket| {
+            .map(|(bucket, priority)| {
                 let lod = bucket.lod;
                 let map = chunk_index.get_mut(lod);
                 let chunks = bucket
@@ -223,6 +241,14 @@ fn schedule_generation<G: ChunkLoader + Send + Sync + 'static>(
                     .filter_map(|&position| {
                         if let Some(&entity) = map.get(&position) {
                             // There is already a chunk, inc RC and scedule only if not generated
+                            // FIXME: entities spawned earlier in this run are still deferred
+                            // (Commands), so this query misses them. A second message touching
+                            // the same position in the same tick (e.g. two subscribers
+                            // bootstrapping overlapping spheres) lands in the error branch:
+                            // the ref is never counted, so the first unsubscribe over-decrements
+                            // and despawns a chunk the other subscriber still holds. Count
+                            // pending incs locally (or spawn with world access) for chunks
+                            // created this run.
                             let Ok((is_loaded, mut sub_count)) = chunk_query.get_mut(entity) else {
                                 eprintln!("Chunk in map, but has no ChunkSubscriberCount");
                                 return None;
@@ -245,7 +271,7 @@ fn schedule_generation<G: ChunkLoader + Send + Sync + 'static>(
                         }
                     })
                     .collect();
-                ChunkReferenceList { lod, chunks }
+                (ChunkReferenceBatch { lod, chunks }, *priority)
             })
             .collect();
 

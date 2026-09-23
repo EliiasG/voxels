@@ -1,11 +1,11 @@
-use crate::chunk::manager::{ChunkGeneratorOutput, ChunkList, ChunkLoader, ChunkReferenceList, SubscriberEntity};
+use crate::chunk::manager::{ChunkGeneratorOutput, ChunkPositionBatch, ChunkLoader, ChunkReferenceBatch, SubscriberEntity, ChunkBatchPriority, ChunkSubscriberPriority};
 
 pub struct SimpleChunkLoader {
     
 }
 
 impl ChunkLoader for SimpleChunkLoader {
-    fn register_subscriber(&mut self, subscriber: SubscriberEntity, priority: u32) {
+    fn register_subscriber(&mut self, subscriber: SubscriberEntity, priority: ChunkSubscriberPriority) {
         todo!()
     }
 
@@ -13,11 +13,11 @@ impl ChunkLoader for SimpleChunkLoader {
         todo!()
     }
 
-    fn register_subscribe_message(&mut self, subscriber: SubscriberEntity, buckets: &Vec<ChunkReferenceList>) {
+    fn register_subscribe_message(&mut self, subscriber: SubscriberEntity, buckets: &Vec<(ChunkReferenceBatch, ChunkBatchPriority)>) {
         todo!()
     }
 
-    fn free_chunks(&mut self, chunks: &ChunkList) {
+    fn free_chunks(&mut self, chunks: &ChunkPositionBatch) {
         todo!()
     }
 
