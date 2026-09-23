@@ -536,6 +536,262 @@ not with glass.
   LEAN), converting normal variance to roughness. The substitute for the TAA water
   doesn't get.
 
+## Draw submission and GPU geometry memory
+
+> Captured 2026-09-23 from a read-through of the old `voxel_engine`'s indirect /
+> paged draw path (mechanics are in `VOXEL_ENGINE_ANALYSIS.md`, "Rendering
+> pipeline — memory layout, culling, draw submission"). Hardware claims are from
+> general knowledge, not checked against target specs; timing numbers are
+> estimates. **Nothing here was measured** — see "Measure first".
+
+### What indirect drawing does — and doesn't — buy
+
+- **It does not make draws run in parallel.** wgpu submits to one queue and a
+  render pass executes its draws in order. Consecutive draws with the same
+  pipeline/state already overlap in the GPU's pipeline whether they are direct or
+  indirect. Splitting LODs into separate passes would *not* run concurrently — it
+  adds attachment load/store and barriers, so it is likely slower.
+- **What it buys is CPU-side submission cost.** On the Vulkan backend
+  `multi_draw_indirect` should be one call with a `drawCount` (my understanding of
+  wgpu's Vulkan backend), so the CPU issues a handful of calls instead of
+  thousands. On backends where wgpu loops it on the CPU (Metal, GL, DX12 without
+  ExecuteIndirect, from memory) every sub-draw costs CPU time, and Metal has no
+  `MULTI_DRAW_INDIRECT_COUNT`.
+- **The old engine was not GPU-driven.** It frustum/backface-culled cached
+  `(chunk, direction)` entries on the CPU, then `queue.write_buffer`'d the whole
+  indirect buffer every frame (opaque + transparent), and issued one
+  `multi_draw_indirect` per slab×LOD (`draw_voxel_geometry`, `render/mod.rs:1339`).
+  The compute-culling item in the old `OPTIMIZATIONS.md` was never implemented.
+- **Instancing is already how it works.** Each face is one instance (6 vertices, no
+  index buffer) and chunk/direction/LOD come from
+  `metadata[instance_index / PAGE_SIZE]`. So draw boundaries carry no meaning for
+  correctness: one draw whose `instance_count` spans many chunks' pages renders
+  correctly. **Many sub-draws exist only because culling leaves gaps** — a draw
+  needs a *contiguous* instance range.
+
+### Why many sub-draws cost something — and how much (with a correction)
+
+Per sub-draw: the command processor fetches/decodes the 16-byte args and sets draw
+state (`first_instance`); the GPU can't know neighbouring ranges are adjacent, so
+it can't fuse them (merging is us doing that fusion in software); each draw rounds
+up to whole waves; and a small draw (a full page is 9 waves of 64) only keeps the GPU
+busy if the next draw overlaps it, so the limit becomes front-end draw rate rather
+than shader throughput. Estimate ~0.1–1 µs per sub-draw (hardware-dependent):
+~5k visible pages is likely under a millisecond, 100k+ can be several ms. Full pages
+are wave-aligned (96 × 6 = 576 = 9 × 64), so only *partial* pages waste lanes.
+
+**Correction:** the first-pass analysis framed tiny draws as the main problem. That
+was overstated — the GPU already overlaps them and the per-draw cost is small.
+Whether it matters is unmeasured.
+
+**Measure first** (the old engine only has CPU-side timers —
+`TIMING_FRUSTUM_CULL_US`, `TIMING_WRITE_INDIRECT_US`, `TIMING_DRAW_CACHE_ENTRIES`):
+1. Sum `draw.count` across the draw list per frame → sub-draw count.
+2. Timestamp queries around the shadow, main and transparent passes → is the GPU
+   even the bottleneck, and in which stage.
+
+If the frame is fragment-bound or the sub-draw count is in the low thousands,
+leave the draw system alone.
+
+### Options for fewer draws (smallest change first)
+
+1. **Merge contiguous pages into runs.** Needs (a) *dense* runs and (b) address
+   order — see "Locality-based batching" below.
+2. **One draw per slab, cull in the vertex shader — rejected as the default.** It
+   works (add a face count + dead flag to `PageMetadata`, using the spare 16 bits of
+   `direction_and_lod`; frustum + backface test from the page metadata and camera
+   uniform; the branch is wave-uniform because a page is 9 whole waves; culled
+   instances emit one out-of-clip position for all 6 vertices so fixed-function
+   rejects the triangles; **not** fragment `discard`, which rasterizes first). But
+   **frame cost becomes proportional to all resident faces, not visible ones**:
+   every culled face still launches vertex waves and goes through primitive
+   assembly, and its 8-byte attribute fetch probably still happens (unverified).
+   With a big view distance most faces are culled — backface culling alone drops
+   about half — so this shades several times more vertices than it draws, and
+   re-reads the whole slab every frame (worst on iGPUs). Only wins when most of the
+   resident world is visible, or when submission-bound with idle vertex throughput.
+3. **Hybrid: region-contiguous allocation + coarse CPU cull per region + per-page
+   vertex-shader refine.** One draw per visible region (say 4×4×4 chunks), little
+   wasted vertex work. Needs the allocator to place each region in a contiguous
+   page range.
+4. **GPU-driven compaction — one draw per pass.** A compute shader tests each
+   chunk-direction entry (frustum, backface, LOD coverage), appends visible
+   `page_index` values to a `visible_pages` buffer with an atomic, and writes
+   `instance_count = visible × PAGE_SIZE` into a single indirect arg; drawn with
+   `multi_draw_indirect_count` (needs the `MULTI_DRAW_INDIRECT_COUNT` feature). The
+   vertex shader stops using vertex attributes and pulls the face itself:
+   `page = visible_pages[instance_index / PAGE_SIZE]`,
+   `face = faces[page * PAGE_SIZE + instance_index % PAGE_SIZE]`. Shadow, main and
+   transparent passes can share the list or each get one from the same compute.
+   Costs: partial last pages need a per-page face count and surplus instances get a
+   degenerate position (exact packing needs a prefix sum); faces move from vertex
+   attributes to a storage buffer — the old 128 MB slab is `174763 × 96 × 8 =
+   134,217,984` bytes, **256 bytes over wgpu's default 128 MiB
+   `maxStorageBufferBindingSize`** (limits may already be raised — unchecked; would
+   need `PAGES_PER_SLAB` floored to 174,762); vertex pulling can be slower than
+   fixed-function fetch on old dGPUs; and it is a real shader/buffer rewrite.
+   Without indirect-count, culled entries must be zeroed (`instance_count = 0`)
+   instead of removed, and each still costs a little front-end time.
+
+The CPU cull + upload cost (option 4's motivation) is unknown until the two CPU
+timers above are read. On iGPUs it matters less: unified memory makes
+`write_buffer` ≈ a memcpy.
+
+### Locality-based batching (space-filling / neighbourhood layout)
+
+Idea: allocate so spatially adjacent chunks live in adjacent pages (2×2 / 3×3
+neighbourhoods, or a space-filling curve), then batch consecutive ranges into one
+draw. Verdict: right direction, and the batching step itself is ~free. Three catches:
+
+1. **Runs must be dense.** A draw is one contiguous instance range, so a partial
+   page in the middle of a run breaks it — and so does the `face_limit` truncation in
+   `build_draw_for_direction` (standard vs total faces), which behaves like a partial
+   page. Either accept a break at each chunk-direction's last page, or pad partial
+   pages with zero-size faces (`w = h = 0`, rejected as degenerate triangles) at a
+   cost of ~half a page of wasted instance slots per chunk-direction.
+2. **Merging needs address order.** Sorting the draw cache per frame is wasted
+   work. Instead keep a per-slab **visibility bitmap indexed by page** (174,763
+   pages ≈ 2.7k `u64` words per slab): set bits for each visible chunk-direction's
+   pages, then scan runs with `trailing_zeros` / `trailing_ones`. Already sorted, tiny.
+3. **Layout key: direction-major, then Hilbert/Morton of chunk position.** Backface
+   culling by direction is the biggest single cull (~half the faces). With a
+   chunk's 6 directions adjacent in memory, visible runs alternate with culled
+   ones; with direction-major layout a culled direction drops out as whole ranges,
+   and a frustum cut through the curve yields few intervals. Hilbert gives the
+   fewest intervals, Morton is simpler, a snake pattern is fine.
+
+**LOD ordering interacts with this.** The old engine deliberately draws LOD 0 first
+(`write_draws_to_indirect`; `VOXEL_ENGINE_ANALYSIS.md` "Draw ordering") so coarser
+geometry behind it is depth-rejected instead of overdrawn. Address-merged runs that
+mix LODs would break that ordering, so either put LOD into the layout key (an arena
+per direction × LOD — my inference, not designed) or accept losing the ordering.
+**Correction:** the first pass also suggested reordering draws slab-outer to cut
+vertex-buffer/bind-group rebinds ("nothing needs LOD grouped"). That ignored the
+early-Z purpose above, and with only 1–2 slabs the rebinds are negligible — drop it.
+
+### Allocating variable-size chunk-direction meshes
+
+Problem: each chunk has an undefined number of pages per direction, so what to hand
+out, and how contiguous, is an allocator question.
+
+| Strategy | Notes |
+|---|---|
+| Fixed pages + free list (old engine) | O(1), no external fragmentation, but no contiguity — every page can be its own draw |
+| Variable-size blocks, **TLSF** | O(1) alloc/free, low fragmentation; the usual choice for GPU mesh arenas. Rust `offset-allocator` crate is a TLSF; I believe Bevy's mesh allocator uses it |
+| Buddy | Power-of-two blocks, up to ~50% internal waste, very simple coalescing |
+| Per-region arenas + compaction | Sodium-style (from memory): a buffer per region, arena with free-list segments, grow/compact by copying; per-chunk facing ranges stored contiguously so consecutive visible facings merge into one draw |
+| Ring buffers | Per-frame/streaming data, not persistent meshes |
+
+**TLSF (two-level segregated fit)** — variable-size blocks from one big range, O(1)
+alloc and free:
+- Free blocks live in bins by size. Level 1 = power-of-two class (`leading_zeros`);
+  level 2 = each class split into e.g. 16 equal sub-bins. Two small bitmaps record
+  which bins are non-empty.
+- *Alloc(n):* round `n` up to the next bin boundary (so every block in that bin
+  fits — "good fit", not best fit); find the smallest non-empty bin at or above it
+  with `trailing_zeros` on the bitmaps; pop a block; if larger than `n`, split and
+  return the remainder to its bin. Waste per allocation bounded ≈ 1/16 with 16
+  sub-bins.
+- *Free:* look at the block's physical neighbours, merge with any that are free,
+  reinsert into the right bin.
+- For GPU memory the block headers live on the CPU; the allocator only returns
+  offsets (here: page numbers).
+
+**What the old engine actually does** (verified in `PageAllocator::allocate` and
+`upload_direction_faces`): pages are allocated **one at a time from the first slab
+with a free page**; slabs are *direction-agnostic* — direction lives only in
+`PageMetadata.direction_and_lod`. The "6 direction buffers per chunk" from the old
+`RENDERING_ARCHITECTURE.md` was replaced by pages, so direction culling acts on draw
+args (`CachedDraw.backface_culled`), not on memory layout, and the visible pages
+are scattered. Fresh loads happen to come out chunk-major and ascending (the free
+list is initialised in reverse and popped), but reuse is LIFO, so pages freed behind
+the camera get reused ahead of it and locality scrambles over time.
+
+**Recommended direction for the new engine:**
+1. **Keep the page as the granularity** (`metadata[instance_index / PAGE_SIZE]` still
+   needs it) and run a TLSF over page indices. Allocate a chunk-direction as **one
+   contiguous run of N pages**, writing metadata for every page in it. No shader
+   change.
+2. **Fall back to several runs when no contiguous block exists.** `CachedDraw.args`
+   is already a list, so this needs no new mechanism. Example: 250 faces = 3 pages;
+   today pages 812, 40, 9001 → 3 draws; a run 812–814 → one draw with
+   `first_instance = 812 × 96`, `instance_count = 250` (the partial last page is
+   fine because it ends the run); no run of 3 free → 2 + 1 → 2 draws.
+3. **Direction-major arenas** (one allocator per direction, possibly × LOD, see
+   above) so backface-culled directions skip whole arenas. The alternative,
+   chunk-major (one block per chunk holding all 6 directions), makes remeshing a
+   single alloc but cannot make every camera octant's visible set contiguous: a
+   chunk shows at most 3 of its 6 facings when the camera is outside its extent on
+   every axis (both of an axis pair when the camera's coordinate lies within the
+   chunk's range on that axis). Since direction culling is the biggest cull, prefer
+   direction-major.
+4. **Compact only if needed.** If large runs stop being available, defragment in the
+   background with `copy_buffer_to_buffer`, a few blocks per frame.
+
+**Frees (correction).** The first pass said deferred frees (by frames in flight)
+were needed. With `queue.write_buffer` and buffer copies on one wgpu queue,
+submission order plus wgpu's inserted barriers already protect against overwriting
+a page a previous submission is still reading, so immediate frees are safe in the
+current design. Deferral matters only for writes the queue doesn't order (mapped
+staging buffers, async compute).
+
+**Latent bug in the old engine — do not port.** `build_draw_for_direction`
+overwrites `slab_index` with each page's slab and keeps only the last one for the
+whole `CachedDraw`; `frustum_cull_cache` then groups *all* of its args under that
+slab. Since allocation takes the first slab with a free page, a direction's pages can
+straddle two slabs once slab 0 nearly fills, and the slab-0 pages would be drawn
+with slab 1's vertex buffer. Found by code reading, not reproduced; only reachable
+past ~16.8M resident faces. Allocating each run inside one slab removes it as a side
+effect.
+
+### Cheaper things before the fragment stage (independent of draw structure)
+
+1. **6 vertices per face, no index buffer** → 6 vertex invocations per quad, each
+   redoing the AO unpack, flip test and direction `switch`. A 4-vertex triangle strip
+   cuts that by a third; the AO diagonal flip becomes a rotation of the strip's
+   corner order.
+2. **`out.normal` is a redundant `vec3` varying** — it's a pure function of
+   `direction`, which is already output flat. Derive it in the fragment shader: 3
+   fewer interpolants.
+3. **Per-frame CPU frustum cull + full indirect upload** for opaque and transparent.
+   Read the two CPU timers before deciding on compute culling (option 4 above).
+4. **Geometry is submitted more than once.** The old shadow depth+normal pass
+   (`shadow/pass.rs`) redraws all opaque geometry at reduced resolution, unjittered,
+   so it cannot double as a depth prepass for the jittered full-resolution main
+   pass. A full-res jittered depth prepass would let `fs_main` run once per pixel via
+   early-Z, at the cost of another vertex pass. *Inference for the new engine:* CSM
+   cascades (see above) each re-submit geometry too, which raises the value of
+   cheap submission (shared visible list from one compute pass, or a coarse region
+   structure reused by all passes).
+
+### Hardware tiers
+
+- **Modern iGPUs** (Intel Xe/Arc, AMD RDNA2/3 APUs, Apple M-series): full compute,
+  storage buffers, multi-draw-indirect. The difference is memory, not features:
+  shared DDR (~50–100 GB/s vs 300+ on a dGPU), so bandwidth is the scarce
+  resource. Keep faces compact (8 B), minimise full-screen targets (TAA history,
+  WBOIT accumulation, the shadow pass), offer a render scale, cut varyings. CPU
+  culling is cheap (no PCIe; `write_buffer` ≈ memcpy), so GPU-driven culling gains
+  less — but CPU and GPU share a power budget. **Apple GPUs are tile-based:** use
+  `DontCare`/`Discard` for depth you don't need, skip depth prepasses (hidden
+  surface removal already handles overdraw), and note wgpu-Metal loops
+  `multi_draw_indirect` and has no indirect-count.
+- **Old dedicated GPUs:** DX11-class or newer (roughly Kepler / GCN 1.0, 2012+) have
+  compute and indirect draws but low compute throughput, and indirect-count may need
+  newer drivers or an extension. Older than that: no compute, often no Vulkan, wgpu
+  would need the GL backend — not worth targeting. **VRAM (often 1–2 GB) is the
+  main limit**, so slab size / view distance / LOD budget matter more than draw
+  count; lighting fragment ALU also weighs heavier there.
+- **Design consequence:** keep **CPU cull + `multi_draw_indirect` as the
+  baseline** (works on any Vulkan device with the multi-draw feature; wgpu loops it
+  elsewhere) and make GPU-driven compaction an *optional* path gated on
+  `adapter.features()` (`MULTI_DRAW_INDIRECT_COUNT` + compute). The old engine
+  hard-requires `POLYGON_MODE_LINE | INDIRECT_FIRST_INSTANCE` (`main.rs:175`), so
+  adapters lacking either fail at startup: `POLYGON_MODE_LINE` is only for
+  wireframe → make it optional; `INDIRECT_FIRST_INSTANCE` is load-bearing for the
+  `first_instance = page_index × PAGE_SIZE` scheme, so it is effectively the
+  feature floor.
+
 ## Recommended build order
 
 1. Greedy-meshed LOD chunks, rasterized. **Baked vertex AO** at mesh time (free,
@@ -585,3 +841,13 @@ not with glass.
 - **How much fast camera / dynamic motion?** Sets how hard TAA's reactive mask + MV
   quality must work — a slow builder camera is the easy regime, vehicle/flight cams
   are not.
+- **Is draw submission actually a bottleneck?** Unmeasured. Needs the per-frame
+  sub-draw count and GPU timestamp queries per pass; gates everything in "Draw
+  submission and GPU geometry memory". If the hardware floor decision above lands on
+  the older/weaker end, CPU-side culling cost vs GPU-driven compaction changes too.
+- **Geometry memory layout:** direction-major arenas (× LOD?) with TLSF over page
+  runs vs chunk-major blocks; region granularity for the hybrid cull; whether to pad
+  partial pages with degenerate faces to keep runs dense.
+- **Is `INDIRECT_FIRST_INSTANCE` an acceptable feature floor?** The page-metadata
+  scheme depends on it; dropping it needs another way to get the page index to the
+  shader.
