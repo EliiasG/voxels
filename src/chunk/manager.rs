@@ -37,7 +37,7 @@ impl<G: ChunkLoader + Send + Sync + 'static> Plugin for ChunkManagerPlugin<G> {
     }
 }
 
-#[derive(Copy, Clone)]
+#[derive(Copy, Clone, Eq, PartialEq, PartialOrd, Ord)]
 pub enum ChunkSubscriberPriority {
     Highest = 0,
     High = 1,
@@ -103,7 +103,11 @@ pub struct ChunkGeneratorOutput {
 }
 
 pub trait ChunkLoader {
-    fn register_subscriber(&mut self, subscriber: SubscriberEntity, priority: ChunkSubscriberPriority);
+    fn register_subscriber(
+        &mut self,
+        subscriber: SubscriberEntity,
+        priority: ChunkSubscriberPriority,
+    );
     fn deregister_subscriber(&mut self, subscriber: SubscriberEntity);
     /// Register unloaded chunks from a [ChunkSubscribeMessage]. Might contain chunks that have already been registered.
     /// Entity ids should be kept for when outputting.
@@ -124,6 +128,23 @@ pub struct ChunkGeneratorResource<G: ChunkLoader>(pub G);
 
 #[derive(Component)]
 pub struct ChunkSubscriberCount(u32);
+
+/// Lowest (highest priority) recorded priority of a chunk
+/// As its never raised, it might be outdated
+#[derive(Component, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
+pub struct ChunkPriority {
+    subscriber: ChunkSubscriberPriority,
+    batch: ChunkBatchPriority,
+}
+
+impl ChunkPriority {
+    pub fn subscriber_priority(&self) -> ChunkSubscriberPriority {
+        self.subscriber
+    }
+    pub fn batch_priority(&self) -> ChunkBatchPriority {
+        self.batch
+    }
+}
 
 impl ChunkSubscriberCount {
     pub fn get(&self) -> u32 {
@@ -226,9 +247,14 @@ fn schedule_generation<G: ChunkLoader + Send + Sync + 'static>(
     mut reader: MessageReader<ChunkSubscribeMessage>,
     mut generator: ResMut<ChunkGeneratorResource<G>>,
     mut chunk_index: ResMut<ChunkIndex>,
-    mut chunk_query: Query<(Has<ChunkData>, &mut ChunkSubscriberCount)>,
+    mut chunk_query: Query<(Has<ChunkData>, &mut ChunkSubscriberCount, &mut ChunkPriority)>,
+    mut subscriber_query: Query<&ChunkSubscriber>,
 ) {
     for message in reader.read() {
+        let Ok(sub) = subscriber_query.get(message.subscriber.0) else {
+            eprintln!("subscribe message from invalid subscriber");
+            continue;
+        };
         let buckets = message
             .buckets
             .iter()
@@ -249,10 +275,11 @@ fn schedule_generation<G: ChunkLoader + Send + Sync + 'static>(
                             // and despawns a chunk the other subscriber still holds. Count
                             // pending incs locally (or spawn with world access) for chunks
                             // created this run.
-                            let Ok((is_loaded, mut sub_count)) = chunk_query.get_mut(entity) else {
+                            let Ok((is_loaded, mut sub_count, mut cpriority)) = chunk_query.get_mut(entity) else {
                                 eprintln!("Chunk in map, but has no ChunkSubscriberCount");
                                 return None;
                             };
+                            *cpriority = cpriority.min(ChunkPriority { subscriber: sub.priority, batch: *priority });
                             sub_count.0 += 1;
                             (!is_loaded).then(|| ChunkReference {
                                 position,
@@ -261,7 +288,14 @@ fn schedule_generation<G: ChunkLoader + Send + Sync + 'static>(
                         } else {
                             // no chunk entity, create one
                             let new = commands
-                                .spawn((ChunkSubscriberCount(1), ChunkPosition(position)))
+                                .spawn((
+                                    ChunkSubscriberCount(1),
+                                    ChunkPosition(position),
+                                    ChunkPriority {
+                                        subscriber: sub.priority,
+                                        batch: *priority,
+                                    },
+                                ))
                                 .id();
                             map.insert(position, new);
                             Some(ChunkReference {
