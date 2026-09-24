@@ -96,7 +96,7 @@ pub struct ChunkReference {
     pub entity: ChunkEntity,
 }
 
-pub struct ChunkGeneratorOutput {
+pub struct ChunkLoaderOutput {
     pub chunk: Arc<ChunkStorage>,
     /// Corresponding chunk entity from subscribe message
     pub entity: ChunkEntity,
@@ -120,11 +120,11 @@ pub trait ChunkLoader {
     /// Called for chunks that are no longer needed
     fn free_chunks(&mut self, chunks: &ChunkPositionBatch);
 
-    fn pop(&mut self) -> Option<ChunkGeneratorOutput>;
+    fn pop(&mut self) -> Option<ChunkLoaderOutput>;
 }
 
 #[derive(Resource)]
-pub struct ChunkGeneratorResource<G: ChunkLoader>(pub G);
+pub struct ChunkLoaderResource<Loader: ChunkLoader>(pub Loader);
 
 #[derive(Component)]
 pub struct ChunkSubscriberCount(u32);
@@ -153,33 +153,33 @@ impl ChunkSubscriberCount {
 }
 
 fn register_subscribers<G: ChunkLoader + Send + Sync + 'static>(
-    mut generator: ResMut<ChunkGeneratorResource<G>>,
+    mut loader: ResMut<ChunkLoaderResource<G>>,
     subscribers: Query<(Entity, &ChunkSubscriber), Added<ChunkSubscriber>>,
 ) {
     for (subscriber, &ChunkSubscriber { priority }) in subscribers.iter() {
-        generator
+        loader
             .0
             .register_subscriber(SubscriberEntity(subscriber), priority);
     }
 }
 
 fn deregister_subscribers<G: ChunkLoader + Send + Sync + 'static>(
-    mut generator: ResMut<ChunkGeneratorResource<G>>,
+    mut loader: ResMut<ChunkLoaderResource<G>>,
     mut subscribers: RemovedComponents<ChunkSubscriber>,
 ) {
     for entity in subscribers.read() {
-        generator.0.deregister_subscriber(SubscriberEntity(entity));
+        loader.0.deregister_subscriber(SubscriberEntity(entity));
     }
 }
 
 fn pop_chunks<G: ChunkLoader + Send + Sync + 'static>(
     mut commands: Commands,
-    mut generator: ResMut<ChunkGeneratorResource<G>>,
+    mut generator: ResMut<ChunkLoaderResource<G>>,
 ) {
     for _ in 0..MAX_CHUNKS_POPPED_PER_TICK {
         // Test the budget before popping: popping past it would consume a finished
         // chunk from the generator and then drop it, stranding the entity in Loading.
-        let Some(ChunkGeneratorOutput { chunk, entity }) = generator.0.pop() else {
+        let Some(ChunkLoaderOutput { chunk, entity }) = generator.0.pop() else {
             break;
         };
         let Ok(mut ec) = commands.get_entity(entity.0) else {
@@ -193,7 +193,7 @@ fn pop_chunks<G: ChunkLoader + Send + Sync + 'static>(
 fn handle_unsubscribed_chunks<G: ChunkLoader + Send + Sync + 'static>(
     mut commands: Commands,
     mut reader: MessageReader<ChunkUnsubscribeMessage>,
-    mut generator: ResMut<ChunkGeneratorResource<G>>,
+    mut generator: ResMut<ChunkLoaderResource<G>>,
     mut chunk_index: ResMut<ChunkIndex>,
     mut chunk_query: Query<&mut ChunkSubscriberCount>,
 ) {
@@ -245,7 +245,7 @@ fn handle_unsubscribed_chunks<G: ChunkLoader + Send + Sync + 'static>(
 fn schedule_generation<G: ChunkLoader + Send + Sync + 'static>(
     mut commands: Commands,
     mut reader: MessageReader<ChunkSubscribeMessage>,
-    mut generator: ResMut<ChunkGeneratorResource<G>>,
+    mut generator: ResMut<ChunkLoaderResource<G>>,
     mut chunk_index: ResMut<ChunkIndex>,
     mut chunk_query: Query<(Has<ChunkData>, &mut ChunkSubscriberCount, &mut ChunkPriority)>,
     mut subscriber_query: Query<&ChunkSubscriber>,

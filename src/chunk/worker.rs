@@ -10,14 +10,14 @@ struct ChunkMesherInput {
     neighbours: [Option<Arc<ChunkStorage>>; NUM_DIRECTIONS],
 }
 
-struct ChunkGeneratorInput {
+struct ChunkLoaderInput {
     position: IVec3,
     lod: usize,
     entity: ChunkEntity,
 }
 
 enum WorkerInput {
-    Generation(ChunkGeneratorInput),
+    Generation(ChunkLoaderInput),
     Mesher(ChunkMesherInput),
 }
 

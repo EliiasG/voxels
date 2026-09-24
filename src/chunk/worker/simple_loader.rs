@@ -1,4 +1,4 @@
-use crate::chunk::manager::{ChunkGeneratorOutput, ChunkPositionBatch, ChunkLoader, ChunkReferenceBatch, SubscriberEntity, ChunkBatchPriority, ChunkSubscriberPriority};
+use crate::chunk::manager::{ChunkLoaderOutput, ChunkPositionBatch, ChunkLoader, ChunkReferenceBatch, SubscriberEntity, ChunkBatchPriority, ChunkSubscriberPriority};
 
 pub struct SimpleChunkLoader {
     
@@ -21,7 +21,7 @@ impl ChunkLoader for SimpleChunkLoader {
         todo!()
     }
 
-    fn pop(&mut self) -> Option<ChunkGeneratorOutput> {
+    fn pop(&mut self) -> Option<ChunkLoaderOutput> {
         todo!()
     }
 }
