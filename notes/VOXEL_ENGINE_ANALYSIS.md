@@ -242,13 +242,13 @@ coupling between generation, meshing, and rendering.
 | generated | `loading::update_chunk_loading` (phase 1) | `ChunkData` | — |
 | invalidated | `meshing::resolve_changes` | `NeedsRemesh` (SparseSet) | — |
 | mesh dispatched | `meshing::start_meshing` | — | `NeedsRemesh` |
-| mesh landed | `meshing::poll_meshing` | `ChunkFaces`, `TransparentChunkFaces`, `ChunkSimpleLights`, `ChunkLtcLights` | — |
-| GPU uploaded | `render::synchronize_gpu` | (GPU pages + `ChunkRenderData` entry) | `ChunkFaces`, `TransparentChunkFaces` |
+| mesh landed | `meshing::poll_meshing` | `ChunkMesh`, `TransparentChunkFaces`, `ChunkSimpleLights`, `ChunkLtcLights` | — |
+| GPU uploaded | `render::synchronize_gpu` | (GPU pages + `ChunkRenderData` entry) | `ChunkMesh`, `TransparentChunkFaces` |
 | lights uploaded | `render::lights::synchronize_lights` | (baked into `ChunkLightStore`) | `ChunkSimpleLights`, `ChunkLtcLights` |
 | unload | `loading::update_chunk_loading` (phase 3) | pushes to `ChunkUnloadQueue` | despawns entity |
 | cleanup | `render::cleanup_unloaded_chunks` | — | GPU pages, shadow grid entry, transparent color entry |
 
-`ChunkFaces`/`TransparentChunkFaces`/`ChunkSimpleLights`/`ChunkLtcLights` are
+`ChunkMesh`/`TransparentChunkFaces`/`ChunkSimpleLights`/`ChunkLtcLights` are
 all transient: produced by the mesh worker, consumed and immediately removed
 by exactly one downstream system apiece, never read a second time.
 
@@ -645,6 +645,6 @@ buffer, resolved with a single fullscreen pass: `final = (1-revealage)*opaque
   uniformly to geometry, chunk-owned lights, dynamic lights, and shadow rays —
   every GPU-facing position follows the same two-part rebase.
 - **Transient marker/data components** (`NeedsGeneration`-equivalent state via
-  `ChunkData` presence, `NeedsRemesh`, `ChunkFaces`, `ChunkSimpleLights`, ...)
+  `ChunkData` presence, `NeedsRemesh`, `ChunkMesh`, `ChunkSimpleLights`, ...)
   are the whole inter-system contract — no subsystem calls another's code
   directly, they only add/remove components and read each other's queues.

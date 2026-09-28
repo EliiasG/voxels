@@ -1,5 +1,8 @@
+use crate::chunk::manager::ChunkReference;
+use crate::chunk::{ChunkData, ChunkEntity, ChunkStorage};
 use bevy::prelude::Component;
 use bytemuck::{Pod, Zeroable};
+use std::sync::Arc;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -19,10 +22,25 @@ pub struct DirFaces {
     pub border: Vec<FaceData>,
 }
 
+pub struct ChunkMesh(pub [DirFaces; 6]);
+
 #[derive(Component)]
 #[component(storage = "SparseSet")]
-pub struct ChunkFaces(pub [DirFaces; 6]);
+pub struct ChunkMeshComponent(Arc<ChunkMesh>);
+
+pub struct ChunkMesherOutput {
+    pub chunk: Arc<ChunkMesh>,
+    /// Corresponding chunk entity for mesh
+    pub entity: ChunkEntity,
+}
 
 pub trait ChunkMesher {
-    
+    // All possible neighbors except the 8 corners, needed for AO
+    fn schedule_meshing(
+        chunk_ref: ChunkReference,
+        chunk_data: Arc<ChunkData>,
+        neighbors: [Option<Arc<ChunkData>>; 18],
+    );
+
+    fn pop() -> Option<ChunkMesherOutput>;
 }
