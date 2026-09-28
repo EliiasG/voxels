@@ -1,6 +1,7 @@
 pub mod manager;
 pub mod subscriber;
 pub mod worker;
+mod meshing;
 
 use std::sync::Arc;
 use crate::utils::{HashMap, PaletteVec};
