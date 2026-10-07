@@ -102,6 +102,7 @@ pub struct ChunkLoaderOutput {
     pub entity: ChunkEntity,
 }
 
+/// TODO Also have a method to reprioritize to higher value priorities when subscriber moves
 pub trait ChunkLoader {
     fn register_subscriber(
         &mut self,
@@ -131,7 +132,7 @@ pub struct ChunkSubscriberCount(u32);
 
 /// Lowest (highest priority) recorded priority of a chunk
 /// As its never raised, it might be outdated
-#[derive(Component, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
+#[derive(Component, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, Default)]
 pub struct ChunkPriority {
     subscriber: ChunkSubscriberPriority,
     batch: ChunkBatchPriority,

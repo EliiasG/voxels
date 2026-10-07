@@ -3,6 +3,9 @@ pub mod subscriber;
 pub mod worker;
 mod meshing;
 
+use crate::chunk::meshing::MissingNeighborCount;
+use crate::chunk::manager::ChunkPriority;
+use crate::chunk::meshing::ChunkMeshComponent;
 use std::sync::Arc;
 use crate::utils::{HashMap, PaletteVec};
 use bevy::prelude::*;
@@ -96,16 +99,20 @@ impl ChunkStorage {
     }
 }
 
+#[derive(Component)]
+#[require(ChunkData, ChunkPosition, ChunkMeshComponent, ChunkPriority, MissingNeighborCount)]
+struct Chunk;
 
 #[derive(Copy, Clone)]
 pub struct ChunkEntity(pub Entity);
 
-#[derive(Component, Clone)]
-pub struct ChunkData(pub Arc<ChunkStorage>);
+#[derive(Component, Clone, Default)]
+pub struct ChunkData(pub Option<Arc<ChunkStorage>>);
 
 #[derive(Component, Clone, Default)]
 pub struct ChunkPosition(pub IVec3);
 
+//TODO use 64 bit keys (22bit X/Z, 20bit Y)
 pub type ChunkHashMap = HashMap<IVec3, Entity>;
 
 //TODO possible dimensions?

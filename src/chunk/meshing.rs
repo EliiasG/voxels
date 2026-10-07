@@ -1,8 +1,11 @@
-use crate::chunk::manager::ChunkReference;
-use crate::chunk::{ChunkData, ChunkEntity, ChunkStorage};
-use bevy::prelude::Component;
+use crate::chunk::manager::{ChunkPriority, ChunkReference};
+use crate::chunk::{ChunkData, ChunkEntity, ChunkIndex, ChunkPosition, ChunkStorage};
+use bevy::math::IVec3;
+use bevy::prelude::{Changed, Component, Query, Res};
 use bytemuck::{Pod, Zeroable};
 use std::sync::Arc;
+
+const CHUNK_MESH_NEIGHBORS: [IVec3; 18] = todo!();
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
@@ -24,9 +27,8 @@ pub struct DirFaces {
 
 pub struct ChunkMesh(pub [DirFaces; 6]);
 
-#[derive(Component)]
-#[component(storage = "SparseSet")]
-pub struct ChunkMeshComponent(Arc<ChunkMesh>);
+#[derive(Component, Default)]
+pub struct ChunkMeshComponent(Option<Arc<ChunkMesh>>);
 
 pub struct ChunkMesherOutput {
     pub chunk: Arc<ChunkMesh>,
@@ -43,4 +45,22 @@ pub trait ChunkMesher {
     );
 
     fn pop() -> Option<ChunkMesherOutput>;
+}
+
+/// Tracks how many chunk neighbors [CHUNK_MESH_NEIGHBORS] of same or less value (more urgent) are spawned but w/o data.
+///
+#[derive(Component, Clone, Copy, Default)]
+pub struct MissingNeighborCount(usize);
+
+
+// FIXME use direct neighbour reference instead of chunk_index
+fn propagate_neighbor_count(
+    chunk_index: Res<ChunkIndex>,
+    // using changed as priorities might upgrade
+    new_chunks: Query<(&ChunkPosition, &ChunkPriority, Option<&OldPriority>), Changed<ChunkPriority>>,
+    mut old_chunks: Query<(&mut MissingNeighborCount, &ChunkPosition, &ChunkPriority)>,
+) {
+    for (pos, priority, old_priority) in old_chunks.iter_mut() {
+
+    }
 }
