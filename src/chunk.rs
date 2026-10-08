@@ -3,26 +3,19 @@ pub mod subscriber;
 pub mod worker;
 mod meshing;
 
-use crate::chunk::meshing::MissingNeighborCount;
+
 use crate::chunk::manager::ChunkPriority;
 use crate::chunk::meshing::ChunkMeshComponent;
-use std::sync::Arc;
+use crate::chunk::meshing::MissingNeighborCount;
 use crate::utils::{HashMap, PaletteVec};
 use bevy::prelude::*;
+use std::sync::Arc;
 
 pub const CHUNK_SIZE: usize = 32;
 pub const CHUNK_SIZE_2: usize = CHUNK_SIZE * CHUNK_SIZE;
 pub const CHUNK_SIZE_3: usize = CHUNK_SIZE * CHUNK_SIZE * CHUNK_SIZE;
 
 pub const MAX_LOD_COUNT: usize = 16;
-
-pub const NUM_DIRECTIONS: usize = 6;
-pub const DIR_POS_X: usize = 0;
-pub const DIR_NEG_X: usize = 1;
-pub const DIR_POS_Y: usize = 2;
-pub const DIR_NEG_Y: usize = 3;
-pub const DIR_POS_Z: usize = 4;
-pub const DIR_NEG_Z: usize = 5;
 
 pub type BlockId = u32;
 pub const AIR: BlockId = 0;
@@ -100,11 +93,50 @@ impl ChunkStorage {
 }
 
 #[derive(Component)]
-#[require(ChunkData, ChunkPosition, ChunkMeshComponent, ChunkPriority, MissingNeighborCount)]
+#[require(
+    ChunkData,
+    ChunkPosition,
+    ChunkNeighbors,
+    ChunkMeshComponent,
+    ChunkPriority,
+    MissingNeighborCount
+)]
 struct Chunk;
 
 #[derive(Copy, Clone)]
 pub struct ChunkEntity(pub Entity);
+
+#[derive(Component, Default)]
+pub struct ChunkNeighbors(pub [Option<ChunkEntity>; 26]);
+
+impl ChunkNeighbors {
+    pub fn neighbor_idx(mut relative_pos: IVec3) -> usize {
+        // must be max abs 1 and not 0
+        debug_assert!(relative_pos.abs().max_element() == 1);
+        relative_pos += IVec3::ONE;
+        let mut idx = relative_pos.x + relative_pos.y * 3 + relative_pos.z * 9;
+        if idx > 1 + 3 + 9 {
+            idx -= 1;
+        }
+        idx as usize
+    }
+
+    pub fn relative_pos(mut neighbor_idx: usize) -> IVec3 {
+        debug_assert!(neighbor_idx < 26);
+        if neighbor_idx >= 1 + 3 + 9 {
+            neighbor_idx += 1;
+        }
+        IVec3::new(
+            (neighbor_idx % 3) as i32,
+            (neighbor_idx / 3 % 3) as i32,
+            (neighbor_idx / 9) as i32,
+        ) - IVec3::ONE
+    }
+
+    pub fn neighbor(&self, relative_pos: IVec3) -> Option<ChunkEntity> {
+        self.0[Self::neighbor_idx(relative_pos)]
+    }
+}
 
 #[derive(Component, Clone, Default)]
 pub struct ChunkData(pub Option<Arc<ChunkStorage>>);
@@ -127,7 +159,7 @@ impl ChunkIndex {
         assert!(lod_count < MAX_LOD_COUNT);
         Self {
             maps: std::array::from_fn(|_| Default::default()),
-            lod_count
+            lod_count,
         }
     }
 

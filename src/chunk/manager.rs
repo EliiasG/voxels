@@ -1,4 +1,4 @@
-use crate::chunk::{ChunkData, ChunkEntity, ChunkIndex, ChunkPosition, ChunkStorage};
+use crate::chunk::{Chunk, ChunkData, ChunkEntity, ChunkIndex, ChunkPosition, ChunkStorage};
 use bevy::prelude::*;
 use std::default::Default;
 use std::marker::PhantomData;
@@ -139,9 +139,12 @@ pub struct ChunkPriority {
 }
 
 impl ChunkPriority {
+
+    #[inline]
     pub fn subscriber_priority(&self) -> ChunkSubscriberPriority {
         self.subscriber
     }
+    #[inline]
     pub fn batch_priority(&self) -> ChunkBatchPriority {
         self.batch
     }
@@ -174,7 +177,7 @@ fn deregister_subscribers<G: ChunkLoader + Send + Sync + 'static>(
 }
 
 fn pop_chunks<G: ChunkLoader + Send + Sync + 'static>(
-    mut commands: Commands,
+    mut query: Query<&mut ChunkData>,
     mut generator: ResMut<ChunkLoaderResource<G>>,
 ) {
     for _ in 0..MAX_CHUNKS_POPPED_PER_TICK {
@@ -183,11 +186,11 @@ fn pop_chunks<G: ChunkLoader + Send + Sync + 'static>(
         let Some(ChunkLoaderOutput { chunk, entity }) = generator.0.pop() else {
             break;
         };
-        let Ok(mut ec) = commands.get_entity(entity.0) else {
+        let Ok(mut data) = query.get_mut(entity.0) else {
             // chunk might unload, but finish generating
             continue;
         };
-        ec.insert(ChunkData(chunk));
+        data.0 = Some(chunk);
     }
 }
 
@@ -288,8 +291,13 @@ fn schedule_generation<G: ChunkLoader + Send + Sync + 'static>(
                             })
                         } else {
                             // no chunk entity, create one
+                            // TODO make function of its own and set up neighbors with following alg:
+                            // For all neigbours, if a chunk exists set its neighbor to self and set neighbor on self
+                            // cache neighbors neighbors for optimize. Also cache known locations with no chunk
+                            // cache could be Option<Option<ChunkEntity>>; 26 where outer opt is whether it has been seen and inner is the possible neighbor
                             let new = commands
                                 .spawn((
+                                    Chunk,
                                     ChunkSubscriberCount(1),
                                     ChunkPosition(position),
                                     ChunkPriority {
