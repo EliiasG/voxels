@@ -1,4 +1,8 @@
-use crate::chunk::{Chunk, ChunkData, ChunkEntity, ChunkIndex, ChunkPosition, ChunkStorage};
+use crate::chunk::meshing::{release_chunk, ChunkReleaseQuery};
+use crate::chunk::neighbors::link_new_chunks;
+use crate::chunk::{
+    Chunk, ChunkData, ChunkEntity, ChunkIndex, ChunkLod, ChunkPosition, ChunkStorage,
+};
 use bevy::prelude::*;
 use std::default::Default;
 use std::marker::PhantomData;
@@ -21,10 +25,13 @@ impl<G: ChunkLoader> ChunkManagerPlugin<G> {
 
 impl<G: ChunkLoader + Send + Sync + 'static> Plugin for ChunkManagerPlugin<G> {
     fn build(&self, app: &mut App) {
+        // Chunks are spawned (and despawned) at the end of the frame and linked to their neighbors
+        // at the start of the next, so everything in between can rely on `ChunkNeighbors`.
         app.add_message::<ChunkSubscribeMessage>()
             .add_message::<ChunkUnsubscribeMessage>()
+            .add_systems(PreUpdate, link_new_chunks)
             .add_systems(
-                FixedUpdate,
+                PostUpdate,
                 (
                     register_subscribers::<G>,
                     deregister_subscribers::<G>,
@@ -46,18 +53,42 @@ pub enum ChunkSubscriberPriority {
     Lowest = 4,
 }
 
-/// Lower number = higher priority
-pub type ChunkBatchPriority = u8;
-
 impl Default for ChunkSubscriberPriority {
     fn default() -> Self {
         Self::Normal
     }
 }
 
+/// Lower number = higher priority
+pub type ChunkBatchPriority = u8;
+
+
 #[derive(Component, Default)]
 pub struct ChunkSubscriber {
     priority: ChunkSubscriberPriority,
+}
+
+/// Lowest (highest priority) recorded priority of a chunk
+/// As its never raised, it might be outdated
+#[derive(Component, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, Default)]
+pub struct ChunkPriority {
+    subscriber: ChunkSubscriberPriority,
+    batch: ChunkBatchPriority,
+}
+
+impl ChunkPriority {
+    pub fn new(subscriber: ChunkSubscriberPriority, batch: ChunkBatchPriority) -> Self {
+        Self { subscriber, batch }
+    }
+
+    #[inline]
+    pub fn subscriber_priority(&self) -> ChunkSubscriberPriority {
+        self.subscriber
+    }
+    #[inline]
+    pub fn batch_priority(&self) -> ChunkBatchPriority {
+        self.batch
+    }
 }
 
 impl ChunkSubscriber {
@@ -130,26 +161,6 @@ pub struct ChunkLoaderResource<Loader: ChunkLoader>(pub Loader);
 #[derive(Component)]
 pub struct ChunkSubscriberCount(u32);
 
-/// Lowest (highest priority) recorded priority of a chunk
-/// As its never raised, it might be outdated
-#[derive(Component, Clone, Copy, Eq, PartialEq, PartialOrd, Ord, Default)]
-pub struct ChunkPriority {
-    subscriber: ChunkSubscriberPriority,
-    batch: ChunkBatchPriority,
-}
-
-impl ChunkPriority {
-
-    #[inline]
-    pub fn subscriber_priority(&self) -> ChunkSubscriberPriority {
-        self.subscriber
-    }
-    #[inline]
-    pub fn batch_priority(&self) -> ChunkBatchPriority {
-        self.batch
-    }
-}
-
 impl ChunkSubscriberCount {
     pub fn get(&self) -> u32 {
         self.0
@@ -200,6 +211,7 @@ fn handle_unsubscribed_chunks<G: ChunkLoader + Send + Sync + 'static>(
     mut generator: ResMut<ChunkLoaderResource<G>>,
     mut chunk_index: ResMut<ChunkIndex>,
     mut chunk_query: Query<&mut ChunkSubscriberCount>,
+    mut release_query: ChunkReleaseQuery,
 ) {
     for message in reader.read() {
         for ChunkPositionBatch { lod, chunks } in &message.buckets {
@@ -228,6 +240,8 @@ fn handle_unsubscribed_chunks<G: ChunkLoader + Send + Sync + 'static>(
                     sub_count.0 -= 1;
                     let despawn = sub_count.0 == 0;
                     if despawn {
+                        // neighbors would otherwise keep waiting for it
+                        release_chunk(chunk, &mut release_query);
                         commands.entity(chunk).despawn();
                         // drop the index entry too, or the coord points at a dead
                         // entity forever and can never be reloaded
@@ -283,23 +297,22 @@ fn schedule_generation<G: ChunkLoader + Send + Sync + 'static>(
                                 eprintln!("Chunk in map, but has no ChunkSubscriberCount");
                                 return None;
                             };
-                            *cpriority = cpriority.min(ChunkPriority { subscriber: sub.priority, batch: *priority });
+                            // not a plain assignment: that would flag the priority as changed even when it is not
+                            let raised = cpriority.min(ChunkPriority { subscriber: sub.priority, batch: *priority });
+                            cpriority.set_if_neq(raised);
                             sub_count.0 += 1;
                             (!is_loaded).then(|| ChunkReference {
                                 position,
                                 entity: ChunkEntity(entity),
                             })
                         } else {
-                            // no chunk entity, create one
-                            // TODO make function of its own and set up neighbors with following alg:
-                            // For all neigbours, if a chunk exists set its neighbor to self and set neighbor on self
-                            // cache neighbors neighbors for optimize. Also cache known locations with no chunk
-                            // cache could be Option<Option<ChunkEntity>>; 26 where outer opt is whether it has been seen and inner is the possible neighbor
+                            // no chunk entity, create one. Neighbors are set up by `link_new_chunks` next frame
                             let new = commands
                                 .spawn((
                                     Chunk,
                                     ChunkSubscriberCount(1),
                                     ChunkPosition(position),
+                                    ChunkLod(lod),
                                     ChunkPriority {
                                         subscriber: sub.priority,
                                         batch: *priority,

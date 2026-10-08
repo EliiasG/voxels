@@ -1,12 +1,11 @@
 pub mod manager;
+pub mod meshing;
+mod neighbors;
 pub mod subscriber;
 pub mod worker;
-mod meshing;
-
 
 use crate::chunk::manager::ChunkPriority;
-use crate::chunk::meshing::ChunkMeshComponent;
-use crate::chunk::meshing::MissingNeighborCount;
+use crate::chunk::meshing::{ChunkMeshComponent, CountedState, MeshStatus, MissingNeighborCount};
 use crate::utils::{HashMap, PaletteVec};
 use bevy::prelude::*;
 use std::sync::Arc;
@@ -96,18 +95,28 @@ impl ChunkStorage {
 #[require(
     ChunkData,
     ChunkPosition,
+    ChunkLod,
     ChunkNeighbors,
     ChunkMeshComponent,
     ChunkPriority,
-    MissingNeighborCount
+    MissingNeighborCount,
+    CountedState,
+    MeshStatus
 )]
 struct Chunk;
 
 #[derive(Copy, Clone)]
 pub struct ChunkEntity(pub Entity);
 
-#[derive(Component, Default)]
-pub struct ChunkNeighbors(pub [Option<ChunkEntity>; 26]);
+/// The 26 surrounding chunks (same LOD) of a chunk, filled in by [neighbors::link_new_chunks].
+///
+/// Outer option: whether the location has been seen. Inner option: the chunk at it, if any.
+/// "Seen and empty" is cached so a new chunk can infer most of its neighbors from the
+/// neighbors it already found, without hash lookups. Every seen slot is kept accurate:
+/// linking writes the new chunk into all its neighbors, and releasing a chunk
+/// ([meshing::release_chunk]) resets their slots to seen and empty.
+#[derive(Component, Clone, Copy, Default)]
+pub struct ChunkNeighbors(pub [Option<Option<ChunkEntity>>; 26]);
 
 impl ChunkNeighbors {
     pub fn neighbor_idx(mut relative_pos: IVec3) -> usize {
@@ -133,8 +142,18 @@ impl ChunkNeighbors {
         ) - IVec3::ONE
     }
 
+    /// The chunk at `relative_pos`, if there is one
     pub fn neighbor(&self, relative_pos: IVec3) -> Option<ChunkEntity> {
+        self.known(relative_pos).flatten()
+    }
+
+    /// `None` if the location has not been seen, otherwise the chunk at it (if any)
+    pub fn known(&self, relative_pos: IVec3) -> Option<Option<ChunkEntity>> {
         self.0[Self::neighbor_idx(relative_pos)]
+    }
+
+    pub fn set(&mut self, relative_pos: IVec3, neighbor: Option<ChunkEntity>) {
+        self.0[Self::neighbor_idx(relative_pos)] = Some(neighbor);
     }
 }
 
@@ -143,6 +162,10 @@ pub struct ChunkData(pub Option<Arc<ChunkStorage>>);
 
 #[derive(Component, Clone, Default)]
 pub struct ChunkPosition(pub IVec3);
+
+/// Which of the [ChunkIndex] maps the chunk lives in
+#[derive(Component, Clone, Copy, Default)]
+pub struct ChunkLod(pub usize);
 
 //TODO use 64 bit keys (22bit X/Z, 20bit Y)
 pub type ChunkHashMap = HashMap<IVec3, Entity>;

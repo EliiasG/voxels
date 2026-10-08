@@ -58,9 +58,9 @@ pub struct SphereSubscriberPlugin;
 impl Plugin for SphereSubscriberPlugin {
     fn build(&self, app: &mut App) {
         // The loading systems read these too; `add_message` is idempotent, so this is
-        // safe regardless of plugin order. Order before `schedule_generation` for
-        // same-tick delivery (messages persist a tick anyway).
-        app.add_systems(FixedUpdate, update_sphere_subscribers);
+        // safe regardless of plugin order. The loading systems run in `PostUpdate`, so
+        // the messages are delivered in the same tick.
+        app.add_systems(Update, update_sphere_subscribers);
     }
 }
 
