@@ -4,19 +4,6 @@ use modul_render::BindGroupLayoutDef;
 
 #[repr(C)]
 #[derive(Copy, Clone, Pod, Zeroable)]
-pub struct FaceData {
-    x: u8,
-    y: u8,
-    z: u8,
-    w: u8,
-    h: u8,
-    /// 4 corners * 2 bits
-    ao: u8,
-    material: u16,
-}
-
-#[repr(C)]
-#[derive(Copy, Clone, Pod, Zeroable)]
 pub struct PageMetadata {
     pub chunk_x: i32,
     pub chunk_y: i32,
