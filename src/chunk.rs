@@ -1,7 +1,7 @@
 pub mod manager;
 pub mod subscriber;
 pub mod worker;
-mod meshing;
+pub mod meshing;
 
 
 use crate::chunk::manager::ChunkPriority;
